@@ -62,3 +62,17 @@ jobs:
 
           echo "Deployment timed out."
           exit 1
+      - name: Verify website is responding
+        run: |
+          for i in {1..10}; do
+            if curl --fail --silent http://54.174.172.6/ > /dev/null; then
+              echo "Website health check passed!"
+              exit 0
+            fi
+
+            echo "Website not ready yet. Retrying..."
+            sleep 6
+          done
+
+          echo "Website health check failed!"
+          exit 1
