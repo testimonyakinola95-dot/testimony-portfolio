@@ -23,12 +23,74 @@ jobs:
           role-to-assume: arn:aws:iam::686194639366:role/GitHubActionsPortfolioDeployRole
           aws-region: us-east-1
 
-      - name: Send deployment command to EC2
+      - name: Deploy with automatic rollback
+        env:
+          DEPLOY_TAG: ${{ github.sha }}
         run: |
+          cat > /tmp/deploy-script.sh <<'REMOTE'
+          set -eu
+
+          cd /home/ubuntu/testimony-portfolio
+
+          echo "Pulling latest source code..."
+          git -c safe.directory=/home/ubuntu/testimony-portfolio pull origin main
+
+          NEW_IMAGE="testimony-portfolio:__DEPLOY_TAG__"
+          CONTAINER="testimony-portfolio-container"
+
+          echo "Building new image: $NEW_IMAGE"
+          docker build -t "$NEW_IMAGE" .
+
+          echo "Preserving the current working image..."
+          if docker image inspect testimony-portfolio:latest >/dev/null 2>&1; then
+            docker tag testimony-portfolio:latest testimony-portfolio:previous
+          fi
+
+          echo "Starting new deployment..."
+          docker rm -f "$CONTAINER" || true
+
+          if docker run -d --restart unless-stopped -p 80:80 --name "$CONTAINER" "$NEW_IMAGE"; then
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if curl --fail --silent http://localhost/ > /dev/null; then
+                echo "New deployment passed its health check!"
+                docker tag "$NEW_IMAGE" testimony-portfolio:latest
+                exit 0
+              fi
+
+              echo "New deployment not ready. Retrying..."
+              sleep 6
+            done
+          fi
+
+          echo "Deployment failed. Starting rollback..."
+
+          docker rm -f "$CONTAINER" || true
+
+          if docker image inspect testimony-portfolio:previous >/dev/null 2>&1; then
+            if docker run -d --restart unless-stopped -p 80:80 --name "$CONTAINER" testimony-portfolio:previous; then
+              for i in 1 2 3 4 5 6 7 8 9 10; do
+                if curl --fail --silent http://localhost/ > /dev/null; then
+                  echo "Rollback successful. Previous website is running."
+                  exit 1
+                fi
+                sleep 6
+              done
+            fi
+          fi
+
+          echo "CRITICAL: Deployment and rollback both failed."
+          exit 1
+          REMOTE
+
+          # Set the actual deployment tag in the remote script.
+          sed -i "s/__DEPLOY_TAG__/${DEPLOY_TAG}/g" /tmp/deploy-script.sh
+
+          python3 -c 'import json; s=open("/tmp/deploy-script.sh").read(); json.dump({"commands":[s]}, open("/tmp/ssm-parameters.json","w"))'
+
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "i-04efad800ba7da47d" \
             --document-name "AWS-RunShellScript" \
-            --parameters '{"commands":["set -e","git -c safe.directory=/home/ubuntu/testimony-portfolio -C /home/ubuntu/testimony-portfolio pull origin main","cd /home/ubuntu/testimony-portfolio","docker build -t testimony-portfolio .","docker rm -f testimony-portfolio-container || true","docker run -d --restart unless-stopped -p 80:80 --name testimony-portfolio-container testimony-portfolio"]}' \
+            --parameters file:///tmp/ssm-parameters.json \
             --query "Command.CommandId" \
             --output text)
 
@@ -44,7 +106,7 @@ jobs:
             echo "Deployment status: $STATUS"
 
             if [ "$STATUS" = "Success" ]; then
-              echo "Portfolio deployed successfully!"
+              echo "Deployment completed successfully!"
               exit 0
             fi
 
@@ -62,6 +124,7 @@ jobs:
 
           echo "Deployment timed out."
           exit 1
+
       - name: Verify website is responding
         run: |
           for i in {1..10}; do
